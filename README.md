@@ -87,13 +87,15 @@ Examples of automation workflows include:
 ---
 
 ## Repository Structure
-powershell/
-evaluation/
-remediation/
-
-macos/
-python/
-labs/
+automation-scripts/
+│
+├── powershell/
+│ ├── evaluation/
+│ └── remediation/
+│
+├── macos/
+├── python/
+└── labs/
 
 
 Production automation scripts are separated from experimental or lab work.

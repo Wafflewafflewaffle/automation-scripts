@@ -3,6 +3,14 @@ REMEDIATION - 7-Zip Update to Latest + Cleanup Older Versions (Windows) [PS 5.1 
 Logs: C:\MME\AutoLogs\7Zip_Remediation.log
 Output: RESULT | ...   NO_ACTION | ...   RESULT | ERROR (...)
 Exit: Always 0
+
+MME Standard Behavior (UPDATED):
+- Always log to C:\MME\AutoLogs
+- Always exit 0
+- Tokens: RESULT | ..., NO_ACTION | ..., RESULT | ERROR (...)
+- Ninja fields:
+  - lastRemediationDate (overwrite) ALWAYS
+  - remediationSummary  (append + line-cap + optional de-dupe) NO hard char-cap
 #>
 
 $ErrorActionPreference = "Stop"
@@ -11,7 +19,8 @@ $LogDir  = "C:\MME\AutoLogs"
 $LogFile = Join-Path $LogDir "7Zip_Remediation.log"
 $DownloadPage = "https://www.7-zip.org/download.html"
 $DownloadDir  = "C:\MME\AutoLogs"
-$LedgerCharCap = 4000
+
+# UPDATED STANDARD: no hard char-cap
 $LedgerLineCap = 60
 
 function Ensure-Dir([string]$p) {
@@ -24,7 +33,99 @@ function Log([string]$m) {
     Add-Content -Path $LogFile -Value "$ts [7Zip] $m"
 }
 
-function Finish([string]$out) {
+function Resolve-NinjaCli {
+    $candidates = @(
+        "C:\ProgramData\NinjaRMMAgent\ninjarmm-cli.exe",
+        "$env:ProgramFiles\NinjaRMMAgent\ninjarmm-cli.exe",
+        "$env:ProgramFiles(x86)\NinjaRMMAgent\ninjarmm-cli.exe"
+    )
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path $c)) { return $c }
+    }
+    return $null
+}
+
+function Set-NinjaField([string]$name, [string]$value) {
+    # Best-effort, but designed to actually work in mixed Ninja environments.
+    try {
+        if (Get-Command ninja-property-set -ErrorAction SilentlyContinue) {
+            ninja-property-set $name "$value" | Out-Null
+            Log "Ninja field set via ninja-property-set: $name = $value"
+            return $true
+        }
+
+        $cli = Resolve-NinjaCli
+        if ($cli) {
+            & $cli set $name "$value" | Out-Null
+            Log "Ninja field set via ninjarmm-cli: $name = $value"
+            return $true
+        }
+
+        Log "WARN: No Ninja field setter found (ninja-property-set missing; ninjarmm-cli missing). Field not set: $name"
+    } catch {
+        Log "WARN: Failed setting Ninja field '$name' (ignored): $($_.Exception.Message)"
+    }
+    return $false
+}
+
+function Get-NinjaField([string]$name) {
+    try {
+        if (Get-Command ninja-property-get -ErrorAction SilentlyContinue) {
+            return (ninja-property-get $name 2>$null | Out-String).Trim()
+        }
+
+        $cli = Resolve-NinjaCli
+        if ($cli) {
+            return ((& $cli get $name 2>$null) | Out-String).Trim()
+        }
+    } catch {}
+    return $null
+}
+
+function Append-RemediationSummary([string]$entry) {
+    try {
+        $existing = Get-NinjaField "remediationSummary"
+        $lines = @()
+
+        if (-not [string]::IsNullOrWhiteSpace($existing)) {
+            $lines = $existing -split "(\r\n|\n|\r)" | Where-Object { $_ -and $_.Trim() -ne "" }
+        }
+
+        $newLine = $entry.Trim()
+
+        # Optional de-dupe: don't append if identical to last line
+        if ($lines.Count -gt 0 -and $lines[-1].Trim() -eq $newLine) {
+            Log "RemediationSummary: last entry identical; skipping duplicate append."
+            return
+        }
+
+        $lines += $newLine
+
+        # UPDATED STANDARD: line cap only (no hard char-cap)
+        if ($lines.Count -gt $LedgerLineCap) {
+            $lines = $lines[-$LedgerLineCap..-1]
+        }
+
+        $combined = ($lines -join "`r`n").Trim()
+        $ok = Set-NinjaField "remediationSummary" $combined
+        if ($ok) { Log "RemediationSummary updated (line-capped=$LedgerLineCap)." }
+        else { Log "WARN: remediationSummary not updated (setter unavailable)." }
+    } catch {
+        Log "WARN: remediationSummary append failed (ignored): $($_.Exception.Message)"
+    }
+}
+
+function Finish([string]$out, [string]$ledgerLine = $null) {
+    try {
+        $iso = (Get-Date).ToString("yyyy-MM-dd")
+        $ok1 = Set-NinjaField "lastRemediationDate" $iso
+        if (-not $ok1) { Log "WARN: lastRemediationDate not updated (setter unavailable)." }
+
+        if ($ledgerLine) { Append-RemediationSummary $ledgerLine }
+    } catch {
+        Log "WARN: Ledger update failed in Finish (ignored): $($_.Exception.Message)"
+    }
+
     Log "FINAL: $out"
     Write-Output $out
     exit 0
@@ -53,11 +154,7 @@ function Get-Latest7Zip {
     $min = [int]$digits.Substring(2,2)
     $ver = ("{0}.{1:D2}" -f $maj, $min)
 
-    if ($href -match '^https?://') {
-        $url = $href
-    } else {
-        $url = "https://www.7-zip.org/" + ($href.TrimStart('/'))
-    }
+    $url = if ($href -match '^https?://') { $href } else { "https://www.7-zip.org/" + ($href.TrimStart('/')) }
 
     Log "Latest parsed: $ver ; MSI: $url"
     return [pscustomobject]@{ Version = $ver; Url = $url }
@@ -104,14 +201,12 @@ function Run-UninstallCmd([string]$cmd) {
     if (-not $cmd) { return }
     $cmd = $cmd.Trim()
 
-    # If MSI, ensure /X + /qn + /norestart
     if ($cmd -match 'msiexec(\.exe)?\s') {
         $cmd = $cmd -replace '\s/I\s', ' /X '
         $cmd = $cmd -replace '\s/i\s', ' /X '
         if ($cmd -notmatch '/qn') { $cmd += " /qn" }
         if ($cmd -notmatch '/norestart') { $cmd += " /norestart" }
     } else {
-        # EXE best-effort silent flag
         if ($cmd -notmatch '(/S|/s|/quiet|/qn|--silent|--quiet)') { $cmd += " /S" }
     }
 
@@ -120,40 +215,13 @@ function Run-UninstallCmd([string]$cmd) {
     Log "Uninstall exit code: $($p.ExitCode) (ignored)"
 }
 
-function Try-UpdateLedger([string]$line) {
-    # Best-effort Ninja field updates; do not fail remediation if CLI differs
-    try {
-        $cli = $null
-        $c1 = "$env:ProgramFiles\NinjaRMMAgent\ninjarmm-cli.exe"
-        $c2 = "$env:ProgramFiles(x86)\NinjaRMMAgent\ninjarmm-cli.exe"
-        if (Test-Path $c1) { $cli = $c1 }
-        elseif (Test-Path $c2) { $cli = $c2 }
-
-        if (-not $cli) { Log "Ninja CLI not found; skipping ledger."; return }
-
-        $iso = (Get-Date).ToString("yyyy-MM-dd")
-        & $cli set lastRemediationDate $iso | Out-Null
-
-        $existing = (& $cli get remediationSummary 2>$null | Out-String).Trim()
-        $lines = @()
-        if ($existing) { $lines = $existing -split "`r?`n" }
-
-        if (!($lines -contains $line)) { $lines += $line }
-
-        if ($lines.Count -gt $LedgerLineCap) { $lines = $lines[-$LedgerLineCap..-1] }
-
-        $newText = ($lines -join "`r`n")
-        if ($newText.Length -gt $LedgerCharCap) { $newText = $newText.Substring($newText.Length - $LedgerCharCap) }
-
-        & $cli set remediationSummary $newText | Out-Null
-        Log "Ledger updated."
-    } catch {
-        Log "Ledger update failed (ignored): $($_.Exception.Message)"
-    }
-}
-
 try {
+    Ensure-Dir $LogDir
     Log "==================== START ===================="
+
+    # Quick visibility: which Ninja setter is available?
+    Log ("Ninja setter availability: ninja-property-set=" + [bool](Get-Command ninja-property-set -EA SilentlyContinue) +
+         " ; ninjarmm-cli=" + [bool](Resolve-NinjaCli))
 
     $latestInfo = Get-Latest7Zip
     $latest = $latestInfo.Version
@@ -163,7 +231,6 @@ try {
         Finish "NO_ACTION | 7-Zip not installed"
     }
 
-    # Determine highest installed version we can see
     $installedVersions = $entries | Where-Object { $_.DisplayVersion } | ForEach-Object { $_.DisplayVersion }
     $highest = ($installedVersions | Sort-Object { [version]$_ } -Descending | Select-Object -First 1)
 
@@ -173,7 +240,6 @@ try {
         Finish "NO_ACTION | 7-Zip already current ($highest)"
     }
 
-    # Uninstall older-than-latest entries
     foreach ($e in $entries) {
         if (-not $e.DisplayVersion) { continue }
         if ([version]$e.DisplayVersion -lt [version]$latest) {
@@ -184,7 +250,6 @@ try {
         }
     }
 
-    # Download latest MSI
     Ensure-Dir $DownloadDir
     $msiName = Split-Path $latestInfo.Url -Leaf
     $msiPath = Join-Path $DownloadDir $msiName
@@ -193,29 +258,30 @@ try {
     Invoke-WebRequest -Uri $latestInfo.Url -OutFile $msiPath -UseBasicParsing -TimeoutSec 120
     if (!(Test-Path $msiPath)) { throw "Download failed; MSI missing at $msiPath" }
 
-    # Install
     Log "Installing latest 7-Zip via msiexec (no reboot)..."
     $args = "/i `"$msiPath`" /qn /norestart"
     $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru
     Log "msiexec exit code: $($p.ExitCode) (ignored)"
 
-    # Verify
     $entries2 = Get-7ZipEntries
     $installedVersions2 = $entries2 | Where-Object { $_.DisplayVersion } | ForEach-Object { $_.DisplayVersion }
     $highest2 = ($installedVersions2 | Sort-Object { [version]$_ } -Descending | Select-Object -First 1)
+
     Log "Post highest: $highest2 ; Latest: $latest"
 
-    $ts = (Get-Date).ToString("yyyy-MM-dd")
-    $ledgerLine = "$ts UPDATED 7-Zip ($highest -> $latest)"
-    Try-UpdateLedger $ledgerLine
+    $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    $ledgerLine = "$ts - 7-Zip UPDATED ($highest -> $latest) | PostHighest=$highest2"
 
     if ($highest2 -and ([version]$highest2 -ge [version]$latest)) {
-        Finish "RESULT | UPDATED 7-Zip ($highest -> $latest)"
+        Finish "RESULT | UPDATED 7-Zip ($highest -> $latest)" $ledgerLine
     } else {
-        Finish "RESULT | ERROR (Update attempted but version did not confirm; pre=$highest post=$highest2 latest=$latest)"
+        Finish "RESULT | ERROR (Update attempted but version did not confirm; pre=$highest post=$highest2 latest=$latest)" `
+            "$ts - 7-Zip ERROR (Update attempted but did not confirm; pre=$highest post=$highest2 latest=$latest)"
     }
 }
 catch {
     Log "ERROR: $($_.Exception.Message)"
-    Finish "RESULT | ERROR (7-Zip remediation failed: $($_.Exception.Message))"
+    $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    Finish "RESULT | ERROR (7-Zip remediation failed: $($_.Exception.Message))" `
+        "$ts - 7-Zip ERROR (Remediation failed: $($_.Exception.Message))"
 }

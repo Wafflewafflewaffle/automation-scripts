@@ -3,6 +3,7 @@ $ErrorActionPreference = "Stop"
 $LogDir  = "C:\MME\AutoLogs"
 $LogFile = Join-Path $LogDir "WOL_Windows_NIC_Baseline.log"
 
+# ---------------- HELPERS ----------------
 function Ensure-Dir($p) {
     if (!(Test-Path $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
 }
@@ -12,27 +13,23 @@ function Log($m) {
     Add-Content -Path $LogFile -Value "$ts [WOL-WinNIC] $m"
 }
 
-function Try-SetWakeOnLanEnabledTrue {
-    # Best-effort Ninja custom field update; do not fail remediation if CLI differs
+function Set-NinjaField($name, $value) {
+    # Best-effort: do not fail remediation if not running under Ninja / cmdlet missing
     try {
-        $cli = $null
-        $c1 = "$env:ProgramFiles\NinjaRMMAgent\ninjarmm-cli.exe"
-        $c2 = "$env:ProgramFiles(x86)\NinjaRMMAgent\ninjarmm-cli.exe"
-        if (Test-Path $c1) { $cli = $c1 }
-        elseif (Test-Path $c2) { $cli = $c2 }
-
-        if (-not $cli) { Log "Ninja CLI not found; skipping wakeonlanEnabled update."; return }
-
-        & $cli set wakeonlanEnabled TRUE | Out-Null
-        Log "Ninja custom field wakeonlanEnabled set to TRUE."
+        if (Get-Command ninja-property-set -ErrorAction SilentlyContinue) {
+            ninja-property-set $name "$value"
+            Log "Ninja field set: $name = $value"
+        } else {
+            Log "Ninja field set skipped (ninja-property-set not found): $name"
+        }
     } catch {
-        Log "WARN: wakeonlanEnabled update failed (ignored): $($_.Exception.Message)"
+        Log "WARN: Failed setting Ninja field '$name' (ignored): $($_.Exception.Message)"
     }
 }
 
 function Finish($out) {
-    # ALWAYS attempt to stamp the field TRUE, regardless of RESULT/NO_ACTION/ERROR
-    Try-SetWakeOnLanEnabledTrue
+    # ALWAYS stamp the custom field TRUE (per requirement)
+    Set-NinjaField "wakeonlanEnabled" "TRUE"
 
     Log "FINAL: $out"
     Write-Output $out
@@ -47,6 +44,7 @@ function Is-PhysicalEthernet($na) {
     return $true
 }
 
+# ---------------- START ----------------
 try {
     Ensure-Dir $LogDir
     Log "============================================================"
@@ -62,6 +60,7 @@ try {
     $aText = (& powercfg /a 2>&1 | Out-String)
     Log "powercfg /a output:`n$aText"
 
+    # Keep your existing verification logic intact
     if ($aText -match "Fast Startup\s+Hibernation is not available" -and
         $aText -match "Hibernation has not been enabled") {
         $changed += "Hibernate/FastStartup enforced OFF"
@@ -74,7 +73,7 @@ try {
     $desiredProps = @(
         @{ Pattern = "^Wake on Magic Packet$";       Desired = "Enabled"  },
         @{ Pattern = "^Wake on pattern match$";      Desired = "Disabled" },
-        @{ Pattern = "^Shutdown Wake-On-Lan$";       Desired = "Enabled"  }, # may not exist on Intel
+        @{ Pattern = "^Shutdown Wake-On-Lan$";       Desired = "Enabled"  }, # may not exist on Intel/Realtek depending on driver
         @{ Pattern = "^System Idle Power Saver$";    Desired = "Disabled" },
         @{ Pattern = "^Ultra Low Power Mode$";       Desired = "Disabled" },
         @{ Pattern = "^Reduce Speed On Power Down$"; Desired = "Disabled" }
@@ -112,7 +111,7 @@ try {
             Log "UPDATED: $($m.DisplayName) '$current' -> '$want'"
         }
 
-        # Best-effort: ensure adapter is allowed to wake (does not hurt if already set)
+        # Best-effort: ensure adapter is allowed to wake
         try {
             & powercfg -deviceenablewake "$($a.InterfaceDescription)" | Out-Null
             Log "powercfg: enabled wake for '$($a.InterfaceDescription)' (best-effort)"

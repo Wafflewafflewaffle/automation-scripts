@@ -3,10 +3,6 @@ $ErrorActionPreference = "Stop"
 $LogDir  = "C:\MME\AutoLogs"
 $LogFile = Join-Path $LogDir "WOL_Windows_NIC_Baseline.log"
 
-# ---- Ninja custom field ----
-$NinjaCFPath = "HKLM:\SOFTWARE\NinjaRMM\Agent\CustomFields"
-$NinjaCFName = "wakeonlanEnabled"
-
 function Ensure-Dir($p) {
     if (!(Test-Path $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
 }
@@ -16,29 +12,28 @@ function Log($m) {
     Add-Content -Path $LogFile -Value "$ts [WOL-WinNIC] $m"
 }
 
-# Always attempt to set Ninja custom field TRUE
-function Set-WOLCustomField {
+function Try-SetWakeOnLanEnabledTrue {
+    # Best-effort Ninja custom field update; do not fail remediation if CLI differs
     try {
-        if (!(Test-Path $NinjaCFPath)) {
-            New-Item -Path $NinjaCFPath -Force | Out-Null
-        }
+        $cli = $null
+        $c1 = "$env:ProgramFiles\NinjaRMMAgent\ninjarmm-cli.exe"
+        $c2 = "$env:ProgramFiles(x86)\NinjaRMMAgent\ninjarmm-cli.exe"
+        if (Test-Path $c1) { $cli = $c1 }
+        elseif (Test-Path $c2) { $cli = $c2 }
 
-        New-ItemProperty `
-            -Path $NinjaCFPath `
-            -Name $NinjaCFName `
-            -Value "TRUE" `
-            -PropertyType String `
-            -Force | Out-Null
+        if (-not $cli) { Log "Ninja CLI not found; skipping wakeonlanEnabled update."; return }
 
-        Log "Custom field '$NinjaCFName' set to TRUE"
-    }
-    catch {
-        Log "WARN: Failed to set Ninja custom field: $($_.Exception.Message)"
+        & $cli set wakeonlanEnabled TRUE | Out-Null
+        Log "Ninja custom field wakeonlanEnabled set to TRUE."
+    } catch {
+        Log "WARN: wakeonlanEnabled update failed (ignored): $($_.Exception.Message)"
     }
 }
 
 function Finish($out) {
-    Set-WOLCustomField
+    # ALWAYS attempt to stamp the field TRUE, regardless of RESULT/NO_ACTION/ERROR
+    Try-SetWakeOnLanEnabledTrue
+
     Log "FINAL: $out"
     Write-Output $out
     exit 0
@@ -79,7 +74,7 @@ try {
     $desiredProps = @(
         @{ Pattern = "^Wake on Magic Packet$";       Desired = "Enabled"  },
         @{ Pattern = "^Wake on pattern match$";      Desired = "Disabled" },
-        @{ Pattern = "^Shutdown Wake-On-Lan$";       Desired = "Enabled"  },
+        @{ Pattern = "^Shutdown Wake-On-Lan$";       Desired = "Enabled"  }, # may not exist on Intel
         @{ Pattern = "^System Idle Power Saver$";    Desired = "Disabled" },
         @{ Pattern = "^Ultra Low Power Mode$";       Desired = "Disabled" },
         @{ Pattern = "^Reduce Speed On Power Down$"; Desired = "Disabled" }
@@ -112,24 +107,18 @@ try {
 
             if ($current -eq $want) { continue }
 
-            Set-NetAdapterAdvancedProperty `
-                -Name $a.Name `
-                -DisplayName $m.DisplayName `
-                -DisplayValue $want `
-                -NoRestart `
-                -ErrorAction Stop
-
+            Set-NetAdapterAdvancedProperty -Name $a.Name -DisplayName $m.DisplayName -DisplayValue $want -NoRestart -ErrorAction Stop
             $changed += "$($a.Name): $($m.DisplayName) '$current' -> '$want'"
             Log "UPDATED: $($m.DisplayName) '$current' -> '$want'"
         }
 
+        # Best-effort: ensure adapter is allowed to wake (does not hurt if already set)
         try {
             & powercfg -deviceenablewake "$($a.InterfaceDescription)" | Out-Null
-            Log "powercfg: enabled wake for '$($a.InterfaceDescription)'"
-        }
-        catch {
+            Log "powercfg: enabled wake for '$($a.InterfaceDescription)' (best-effort)"
+        } catch {
             Log "WARN: powercfg enablewake failed: $($_.Exception.Message)"
-            $notes += "$($a.Name): enablewake failed"
+            $notes += "$($a.Name): powercfg enablewake failed"
         }
     }
 

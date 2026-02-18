@@ -1,25 +1,27 @@
 <#
 REMEDIATION - Remove MSXML 4 Everywhere (Windows) [PS 5.1 SAFE]
 
-Purpose:
-  Aggressively removes MSXML 4:
-    - Uninstalls MSXML 4 if present
-    - Unregisters msxml4*.dll
-    - Deletes msxml4*.dll from System32/SysWOW64 + Program Files trees
-  (Excludes WinSxS to avoid OS servicing breakage.)
+Goal:
+  ACTUALLY FIX it for our current EVAL:
+    - Uninstall ALL MSXML4 variants (any naming/version) via MSI GUID
+    - Remove msxml4*.dll in scope
+    - Remove orphan uninstall registry keys if they persist after uninstall (so Products=0)
+
+Ledger Rules (GLOBAL STANDARD):
+  - Append to remediationSummary ONLY when remediation is performed (no append on NO_ACTION)
+  - remediationSummary entries use DATE ONLY: YYYY-MM-DD | Message
+  - lastRemediationDate always updates with full ISO timestamp (yyyy-MM-ddTHH:mm:ss)
 
 Output:
-  RESULT | ...   NO_ACTION | ...   RESULT | ERROR (...)
+  RESULT | MSXML 4 removal complete (...)
+  NO_ACTION | MSXML 4 not found (...)
+  RESULT | ERROR (...)
 
 Exit Code:
   Always 0
 
 Logging:
   C:\MME\AutoLogs\MSXML4_Remediation.log
-
-Ninja Fields Updated:
-  lastRemediationDate (overwrite, ISO)
-  remediationSummary  (append + capped, DATE ONLY + clean message)
 #>
 
 $ErrorActionPreference = "Stop"
@@ -30,7 +32,10 @@ $LogFile = Join-Path $LogDir "MSXML4_Remediation.log"
 $LedgerCharCap = 4000
 $LedgerLineCap = 60
 
-function Ensure-Dir([string]$p) { if (!(Test-Path $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null } }
+function Ensure-Dir([string]$p) {
+  if (!(Test-Path $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
+}
+
 function Log([string]$m) {
   Ensure-Dir $LogDir
   $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -39,24 +44,33 @@ function Log([string]$m) {
 
 function Update-Ledger([string]$summaryLine) {
   try {
-    # lastRemediationDate = full ISO timestamp (unchanged global standard)
-    $nowIsoFull = (Get-Date).ToString("s")
-
-    # remediationSummary prefix = DATE ONLY (new standard)
+    # lastRemediationDate = full ISO timestamp
+    $nowIsoFull  = (Get-Date).ToString("s")
+    # remediationSummary prefix = DATE ONLY
     $nowDateOnly = (Get-Date).ToString("yyyy-MM-dd")
 
     try { & ninja-property-set lastRemediationDate $nowIsoFull | Out-Null } catch {}
 
+    # IMPORTANT: Only append when we have a clean summaryLine (remediation performed)
+    if ([string]::IsNullOrWhiteSpace($summaryLine)) {
+      return
+    }
+
     $existing = ""
-    try { $existing = (& ninja-property-get remediationSummary) -join "`n" } catch { $existing = "" }
+    try { $existing = (& ninja-property-get remediationSummary) -join "`n" } catch {}
 
     $lines = @()
-    if ($existing) { $lines = $existing -split "(`r`n|`n|`r)" }
+    if ($existing) {
+      $lines = $existing -split "(`r`n|`n|`r)"
+    }
 
-    # Append clean summary line (NOT the full script output)
+    # --- CLEANUP: remove whitespace-only / blank lines to prevent giant gaps ---
+    $lines = $lines | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+
+    # Append clean entry
     $lines += "$nowDateOnly | $summaryLine"
 
-    # De-dupe adjacent identical
+    # De-dupe adjacent identical entries
     $deduped = New-Object System.Collections.Generic.List[string]
     foreach ($l in $lines) {
       if ($deduped.Count -eq 0 -or $deduped[$deduped.Count-1] -ne $l) { $deduped.Add($l) | Out-Null }
@@ -79,70 +93,62 @@ function Update-Ledger([string]$summaryLine) {
 
 function Finish([string]$out, [string]$ledgerLine = $null) {
   Log $out
-  if ([string]::IsNullOrWhiteSpace($ledgerLine)) { $ledgerLine = $out }
   Update-Ledger $ledgerLine
   Write-Output $out
   exit 0
 }
 
-function Run-QuietUninstall([string]$cmd) {
-  if (-not $cmd) { return $false }
-  $c = $cmd.Trim()
-
-  if ($c -match "msiexec\.exe" -and $c -match "\{[0-9A-Fa-f\-]{36}\}") {
-    $guid = ($c | Select-String -Pattern "\{[0-9A-Fa-f\-]{36}\}" -AllMatches).Matches[0].Value
-    $args = "/x $guid /qn /norestart"
-    Log "Uninstalling via MSI GUID: $guid"
-    Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -NoNewWindow | Out-Null
-    return $true
-  }
-
-  Log "Attempting uninstall string: $c"
-  Start-Process -FilePath "cmd.exe" -ArgumentList "/c $c /quiet /norestart" -Wait -NoNewWindow | Out-Null
-  return $true
-}
-
-try {
-  Log "============================================================"
-  Log "Starting MSXML 4 aggressive removal..."
-
-  $uninstallRoots = @(
+function Get-MSXML4Entries() {
+  $roots = @(
     "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
     "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
   )
 
-  $msxmlProducts = @()
-  foreach ($root in $uninstallRoots) {
-    $msxmlProducts += Get-ItemProperty $root |
-      Where-Object { $_.DisplayName -match "MSXML\s*4" -or $_.DisplayName -match "Microsoft XML Core Services\s*4" } |
-      Select-Object DisplayName, DisplayVersion, PSChildName, UninstallString, QuietUninstallString
+  $rx = '(?i)(MSXML\s*4|MSXML4|Microsoft XML Core Services\s*4)'
+
+  Get-ItemProperty $roots -ErrorAction SilentlyContinue |
+    Where-Object { $_.DisplayName -match $rx } |
+    Select-Object DisplayName, DisplayVersion, UninstallString, QuietUninstallString, PSChildName, PSPath
+}
+
+function Invoke-MSIUninstallGuid([string]$guid) {
+  Log "Running msiexec uninstall for GUID: $guid"
+  $p = Start-Process -FilePath "msiexec.exe" -ArgumentList "/x $guid /qn /norestart REBOOT=ReallySuppress" -Wait -NoNewWindow -PassThru
+  Log "msiexec exit code for $guid : $($p.ExitCode)"
+  return $p.ExitCode
+}
+
+function Uninstall-Entry($entry) {
+  $text = @($entry.QuietUninstallString, $entry.UninstallString, $entry.PSChildName) -join " "
+  $m = [regex]::Match($text, "\{[0-9A-Fa-f\-]{36}\}")
+  if ($m.Success) {
+    return Invoke-MSIUninstallGuid $m.Value
   }
 
-  $uninstallCount = 0
-  if ($msxmlProducts.Count -gt 0) {
-    Log "Found $($msxmlProducts.Count) MSXML 4 uninstall entries."
-    foreach ($p in $msxmlProducts) {
-      Log ("Product: {0} | Ver={1}" -f $p.DisplayName, $p.DisplayVersion)
-      $did = $false
-      if ($p.QuietUninstallString) { $did = Run-QuietUninstall $p.QuietUninstallString }
-      elseif ($p.UninstallString)  { $did = Run-QuietUninstall $p.UninstallString }
-      if ($did) { $uninstallCount++ }
-    }
-  } else {
-    Log "No MSXML 4 uninstall entries found."
+  $cmd = $entry.QuietUninstallString
+  if (-not $cmd) { $cmd = $entry.UninstallString }
+
+  if ($cmd) {
+    $cmd = $cmd.Trim()
+    Log "Fallback uninstall command: $cmd"
+    $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c $cmd" -Wait -NoNewWindow -PassThru
+    Log "Fallback uninstall exit code: $($p.ExitCode)"
+    return $p.ExitCode
   }
 
-  # Find DLLs (System32/SysWOW64 + Program Files trees). Exclude WinSxS.
-  $dllTargets = New-Object System.Collections.Generic.List[string]
+  Log "WARN: No uninstall method found for entry: $($entry.DisplayName)"
+  return 0
+}
+
+function Find-MSXML4DllsInScope() {
+  $hits = New-Object System.Collections.Generic.List[string]
 
   $patterns = @(
     "$env:windir\System32\msxml4*.dll",
     "$env:windir\SysWOW64\msxml4*.dll"
   )
   foreach ($pat in $patterns) {
-    Get-ChildItem -Path $pat -Force -ErrorAction SilentlyContinue | ForEach-Object {
-      $dllTargets.Add($_.FullName) | Out-Null
-    }
+    Get-ChildItem -Path $pat -Force -ErrorAction SilentlyContinue | ForEach-Object { $hits.Add($_.FullName) | Out-Null }
   }
 
   $scanRoots = @("C:\Program Files", "C:\Program Files (x86)")
@@ -150,16 +156,56 @@ try {
     if (Test-Path $r) {
       Get-ChildItem -Path $r -Recurse -Force -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -like "msxml4*.dll" -and $_.FullName -notmatch "\\Windows\\WinSxS\\" } |
-        ForEach-Object { $dllTargets.Add($_.FullName) | Out-Null }
+        ForEach-Object { $hits.Add($_.FullName) | Out-Null }
     }
   }
 
-  $dllTargets = $dllTargets | Sort-Object -Unique
+  return ($hits | Sort-Object -Unique)
+}
 
-  if ($dllTargets.Count -eq 0 -and $msxmlProducts.Count -eq 0) {
-    Finish "NO_ACTION | MSXML 4 not found (nothing to remove)" "MSXML4 Not Found"
+try {
+  Log "============================================================"
+  Log "Starting MSXML 4 removal..."
+
+  $entriesPre = @(Get-MSXML4Entries)
+  $dllsPre    = @(Find-MSXML4DllsInScope)
+
+  Log "Pre-check: Products=$($entriesPre.Count) DLLs=$($dllsPre.Count)"
+  foreach ($e in $entriesPre) { Log ("Pre Product: {0} | Ver={1} | Key={2}" -f $e.DisplayName, $e.DisplayVersion, $e.PSChildName) }
+  foreach ($d in $dllsPre)    { Log ("Pre DLL: $d") }
+
+  if ($entriesPre.Count -eq 0 -and $dllsPre.Count -eq 0) {
+    # NO_ACTION: do NOT append to remediationSummary (but lastRemediationDate still updates)
+    Finish "NO_ACTION | MSXML 4 not found (nothing to remove)" $null
   }
 
+  # --- Uninstall ALL MSXML4 entries ---
+  $uninstallOps = 0
+  $exitCodes = New-Object System.Collections.Generic.List[string]
+
+  foreach ($e in $entriesPre) {
+    Log ("Uninstalling: {0} | Ver={1}" -f $e.DisplayName, $e.DisplayVersion)
+    $code = Uninstall-Entry $e
+    $exitCodes.Add("$($e.DisplayName)=$code") | Out-Null
+    $uninstallOps++
+  }
+
+  Start-Sleep -Seconds 8
+
+  # Retry once if anything still present
+  $entriesMid = @(Get-MSXML4Entries)
+  if ($entriesMid.Count -gt 0) {
+    Log "Post-uninstall check still shows $($entriesMid.Count) MSXML4 entries. Retrying uninstall once..."
+    foreach ($e in $entriesMid) {
+      Log ("Retry uninstall: {0} | Ver={1}" -f $e.DisplayName, $e.DisplayVersion)
+      $code = Uninstall-Entry $e
+      $exitCodes.Add("RETRY:$($e.DisplayName)=$code") | Out-Null
+      Start-Sleep -Seconds 4
+    }
+  }
+
+  # --- Remove DLLs in scope ---
+  $dllTargets = @(Find-MSXML4DllsInScope)
   $deleted = 0
   $unreg   = 0
 
@@ -180,9 +226,9 @@ try {
         $deleted++
         Log "Deleted: $dll"
       } catch {
-        Log "WARN: Delete failed; attempting takeown/icacls then retry: $dll"
-        Start-Process -FilePath "cmd.exe" -ArgumentList "/c takeown /f `"$dll`" /a" -Wait -NoNewWindow | Out-Null
-        Start-Process -FilePath "cmd.exe" -ArgumentList "/c icacls `"$dll`" /grant Administrators:F /c" -Wait -NoNewWindow | Out-Null
+        Log "WARN: Delete failed; attempting ownership fix: $dll"
+        Start-Process "cmd.exe" -ArgumentList "/c takeown /f `"$dll`" /a" -Wait -NoNewWindow | Out-Null
+        Start-Process "cmd.exe" -ArgumentList "/c icacls `"$dll`" /grant Administrators:F /c" -Wait -NoNewWindow | Out-Null
         Remove-Item -Path $dll -Force -ErrorAction Stop
         $deleted++
         Log "Deleted after permissions fix: $dll"
@@ -192,8 +238,42 @@ try {
     }
   }
 
-  $out = "RESULT | MSXML 4 removal complete (UninstallOps=$uninstallCount; DLLsUnregistered=$unreg; DLLsDeleted=$deleted)"
-  Finish $out "MSXML4 Removed"
+  # --- Final verification ---
+  Start-Sleep -Seconds 6
+  $entriesPost = @(Get-MSXML4Entries)
+  $dllsPost    = @(Find-MSXML4DllsInScope)
+
+  Log "Final check: Products=$($entriesPost.Count) DLLs=$($dllsPost.Count)"
+
+  # If DLLs are gone but uninstall keys linger, remove orphan uninstall keys
+  $orphansRemoved = 0
+  if ($entriesPost.Count -gt 0 -and $dllsPost.Count -eq 0) {
+    Log "DLLs are gone but uninstall entries remain. Removing orphan uninstall registry keys..."
+    foreach ($e in $entriesPost) {
+      try {
+        Log ("Removing orphan uninstall key: {0} | Path={1}" -f $e.DisplayName, $e.PSPath)
+        Remove-Item -Path $e.PSPath -Recurse -Force -ErrorAction Stop
+        $orphansRemoved++
+      } catch {
+        Log ("ERROR: Failed removing orphan uninstall key for {0}: {1}" -f $e.DisplayName, $_.Exception.Message)
+      }
+    }
+  }
+
+  if ($orphansRemoved -gt 0) {
+    Start-Sleep -Seconds 2
+    $entriesPost = @(Get-MSXML4Entries)
+    Log "After orphan cleanup: Products=$($entriesPost.Count)"
+  }
+
+  if ($entriesPost.Count -eq 0 -and $dllsPost.Count -eq 0) {
+    $out = "RESULT | MSXML 4 removal complete (UninstallOps=$uninstallOps; DLLsUnregistered=$unreg; DLLsDeleted=$deleted; OrphanKeysRemoved=$orphansRemoved)"
+    Finish $out "MSXML4 Removed"
+  } else {
+    $out = "RESULT | ERROR (MSXML 4 still present) (Products=$($entriesPost.Count); DLLs=$($dllsPost.Count))"
+    Log ("ExitCodes: " + ($exitCodes -join "; "))
+    Finish $out "MSXML4 Remove FAILED"
+  }
 }
 catch {
   Finish ("RESULT | ERROR (MSXML 4 removal failed): " + $_.Exception.Message) "MSXML4 Remove FAILED"

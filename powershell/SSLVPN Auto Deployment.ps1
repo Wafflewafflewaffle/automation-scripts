@@ -1,0 +1,231 @@
+# =========================================
+# OpenVPN Community Deployment Script
+# MME Automation / Remediation Playbook-Aligned
+# =========================================
+#
+# PURPOSE:
+# - Download and install OpenVPN Community Edition
+# - Ensure a usable TAP adapter exists
+# - Build an inline OVPN profile from transferred client files
+# - Deploy the profile to OpenVPN
+# - Launch OpenVPN GUI and trigger connection
+#
+# DEPENDENCY:
+# This script depends on a file transfer of the CLIENT OVPN FILES
+# into:
+#   C:\MME\CS\client
+#
+# REQUIRED TRANSFERRED FILES:
+#   C:\MME\CS\client\client.ovpn
+#   C:\MME\CS\client\ca.crt
+#   C:\MME\CS\client\client.crt
+#   C:\MME\CS\client\client.pem
+#
+# NOTES:
+# - This script is intended for deployment/use-case automation.
+# - It does not include Ninja remediation ledger updates by default.
+# - User authentication / MFA still occurs at connection time.
+
+$ErrorActionPreference = 'Stop'
+
+# -------------------------------------
+# Paths / Variables
+# -------------------------------------
+
+$StagePath   = "C:\MME\CS"
+$ClientPath  = Join-Path $StagePath "client"
+$LogPath     = "C:\MME\AutoLogs"
+$LogFile     = Join-Path $LogPath "OpenVPN_Deployment.log"
+
+$DownloadUrl = "https://swupdate.openvpn.org/community/releases/OpenVPN-2.6.10-I001-amd64.msi"
+$Installer   = Join-Path $StagePath "OpenVPN-2.6.10-I001-amd64.msi"
+
+$TapCtl      = "C:\Program Files\OpenVPN\bin\tapctl.exe"
+$Gui         = "C:\Program Files\OpenVPN\bin\openvpn-gui.exe"
+$ConfigDir   = "C:\Program Files\OpenVPN\config"
+$DeployedOvpn = Join-Path $ConfigDir "client.ovpn"
+
+$OvpnPath    = Join-Path $ClientPath "client.ovpn"
+$CaPath      = Join-Path $ClientPath "ca.crt"
+$CrtPath     = Join-Path $ClientPath "client.crt"
+$KeyPath     = Join-Path $ClientPath "client.pem"
+$OutPath     = Join-Path $ClientPath "client_inline.ovpn"
+
+# -------------------------------------
+# Functions
+# -------------------------------------
+
+function Write-Log {
+    param([string]$Message)
+
+    $Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $Line = "$Timestamp  $Message"
+
+    Write-Output $Line
+    $Line | Out-File -FilePath $LogFile -Append -Encoding utf8
+}
+
+function Ensure-Directory {
+    param([string]$Path)
+
+    if (!(Test-Path $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
+}
+
+# -------------------------------------
+# Execution
+# -------------------------------------
+
+try {
+    Ensure-Directory -Path $StagePath
+    Ensure-Directory -Path $ClientPath
+    Ensure-Directory -Path $LogPath
+
+    Write-Log "---- OpenVPN Deployment Starting ----"
+
+    # -------------------------------------
+    # Download OpenVPN Community Installer
+    # -------------------------------------
+
+    Write-Log "Downloading OpenVPN Community installer"
+    Invoke-WebRequest -Uri $DownloadUrl -OutFile $Installer
+
+    if (!(Test-Path $Installer)) {
+        throw "Download failed: installer not found at $Installer"
+    }
+
+    Write-Log "Installer downloaded: $Installer"
+
+    # -------------------------------------
+    # Install OpenVPN Community
+    # -------------------------------------
+
+    Write-Log "Installing OpenVPN Community"
+    Start-Process "msiexec.exe" -ArgumentList "/i `"$Installer`" /qn /norestart" -Wait
+
+    Write-Log "OpenVPN installation completed"
+
+    # -------------------------------------
+    # Ensure TAP Adapter Exists
+    # -------------------------------------
+
+    if (!(Test-Path $TapCtl)) {
+        throw "tapctl.exe not found: $TapCtl"
+    }
+
+    $Tap = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+        $_.InterfaceDescription -like "*TAP*" -and
+        $_.Status -ne "Not Present"
+    }
+
+    if (!$Tap) {
+        Write-Log "No working TAP adapter found. Creating one."
+        & $TapCtl create | Out-Null
+        Start-Sleep -Seconds 3
+        Write-Log "TAP adapter created"
+    }
+    else {
+        Write-Log "Existing TAP adapter detected"
+    }
+
+    # -------------------------------------
+    # Validate Transferred Client Files
+    # -------------------------------------
+
+    Write-Log "Validating transferred client OVPN files"
+
+    if (!(Test-Path $OvpnPath)) { throw "Missing file: $OvpnPath" }
+    if (!(Test-Path $CaPath))   { throw "Missing file: $CaPath" }
+    if (!(Test-Path $CrtPath))  { throw "Missing file: $CrtPath" }
+    if (!(Test-Path $KeyPath))  { throw "Missing file: $KeyPath" }
+
+    Write-Log "All required client files found"
+
+    # -------------------------------------
+    # Generate Inline OVPN Profile
+    # -------------------------------------
+
+    Write-Log "Generating inline VPN profile"
+
+    $Ovpn = Get-Content $OvpnPath -Raw
+    $Ca   = Get-Content $CaPath   -Raw
+    $Crt  = Get-Content $CrtPath  -Raw
+    $Key  = Get-Content $KeyPath  -Raw
+
+    # Remove external cert/key references
+    $Ovpn = $Ovpn -replace '(?im)^\s*ca\s+.+\r?\n?', ''
+    $Ovpn = $Ovpn -replace '(?im)^\s*cert\s+.+\r?\n?', ''
+    $Ovpn = $Ovpn -replace '(?im)^\s*key\s+.+\r?\n?', ''
+
+    # Ensure WatchGuard/OpenVPN 2.6 cipher compatibility
+    if ($Ovpn -notmatch '(?im)^\s*data-ciphers\s+') {
+        $CipherBlock = @"
+cipher AES-256-CBC
+data-ciphers AES-256-GCM:AES-256-CBC
+data-ciphers-fallback AES-256-CBC
+
+"@
+        $Ovpn = $CipherBlock + $Ovpn
+    }
+
+    $Ovpn = $Ovpn.TrimEnd()
+
+    $InlineBlock = @"
+
+<ca>
+$($Ca.Trim())
+</ca>
+
+<cert>
+$($Crt.Trim())
+</cert>
+
+<key>
+$($Key.Trim())
+</key>
+"@
+
+    $Final = $Ovpn + "`r`n" + $InlineBlock.TrimStart()
+    Set-Content -Path $OutPath -Value $Final -Encoding ascii
+
+    Write-Log "Inline VPN profile created: $OutPath"
+
+    # -------------------------------------
+    # Deploy Profile to OpenVPN
+    # -------------------------------------
+
+    Ensure-Directory -Path $ConfigDir
+    Copy-Item $OutPath $DeployedOvpn -Force
+
+    Write-Log "VPN profile deployed to: $DeployedOvpn"
+
+    # -------------------------------------
+    # Launch GUI
+    # -------------------------------------
+
+    if (!(Test-Path $Gui)) {
+        throw "OpenVPN GUI missing: $Gui"
+    }
+
+    Write-Log "Launching OpenVPN GUI"
+    Start-Process $Gui
+
+    Start-Sleep -Seconds 3
+
+    # -------------------------------------
+    # Trigger Connection
+    # -------------------------------------
+
+    Write-Log "Triggering VPN connection"
+    & $Gui --connect client.ovpn
+
+    Write-Log "---- OpenVPN Deployment Complete ----"
+    Write-Output "SUCCESS"
+    exit 0
+}
+catch {
+    Write-Log "ERROR: $($_.Exception.Message)"
+    Write-Output "ERROR"
+    exit 1
+}

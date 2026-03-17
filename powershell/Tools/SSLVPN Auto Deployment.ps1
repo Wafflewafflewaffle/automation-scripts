@@ -2,29 +2,6 @@
 # OpenVPN Community Deployment Script
 # MME Automation / Remediation Playbook-Aligned
 # =========================================
-#
-# PURPOSE:
-# - Download and install OpenVPN Community Edition
-# - Ensure a usable TAP adapter exists
-# - Build an inline OVPN profile from transferred client files
-# - Deploy the profile to OpenVPN
-# - Launch OpenVPN GUI and trigger connection
-#
-# DEPENDENCY:
-# This script depends on a file transfer of the CLIENT OVPN FILES
-# into:
-#   C:\MME\CS\client
-#
-# REQUIRED TRANSFERRED FILES:
-#   C:\MME\CS\client\client.ovpn
-#   C:\MME\CS\client\ca.crt
-#   C:\MME\CS\client\client.crt
-#   C:\MME\CS\client\client.pem
-#
-# NOTES:
-# - This script is intended for deployment/use-case automation.
-# - It does not include Ninja remediation ledger updates by default.
-# - User authentication / MFA still occurs at connection time.
 
 $ErrorActionPreference = 'Stop'
 
@@ -130,6 +107,41 @@ try {
     }
 
     # -------------------------------------
+    # Extract Client Package (TGZ)
+    # -------------------------------------
+
+    $TgzPath = Join-Path $StagePath "client.tgz"
+
+    if (Test-Path $TgzPath) {
+        Write-Log "Client TGZ detected: $TgzPath"
+
+        # Clean existing client directory
+        if (Test-Path $ClientPath) {
+            Write-Log "Clearing existing client directory"
+            Remove-Item "$ClientPath\*" -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        Write-Log "Extracting client TGZ"
+        Expand-Archive -Path $TgzPath -DestinationPath $StagePath -Force
+
+        Start-Sleep -Seconds 2
+
+        # Handle nested structure
+        $NestedClient = Join-Path $StagePath "client\client"
+
+        if (Test-Path $NestedClient) {
+            Write-Log "Nested client folder detected. Flattening structure"
+            Move-Item "$NestedClient\*" $ClientPath -Force
+            Remove-Item $NestedClient -Recurse -Force
+        }
+
+        Write-Log "Client TGZ extraction complete"
+    }
+    else {
+        Write-Log "No client TGZ found. Assuming files already present"
+    }
+
+    # -------------------------------------
     # Validate Transferred Client Files
     # -------------------------------------
 
@@ -153,12 +165,10 @@ try {
     $Crt  = Get-Content $CrtPath  -Raw
     $Key  = Get-Content $KeyPath  -Raw
 
-    # Remove external cert/key references
     $Ovpn = $Ovpn -replace '(?im)^\s*ca\s+.+\r?\n?', ''
     $Ovpn = $Ovpn -replace '(?im)^\s*cert\s+.+\r?\n?', ''
     $Ovpn = $Ovpn -replace '(?im)^\s*key\s+.+\r?\n?', ''
 
-    # Ensure WatchGuard/OpenVPN 2.6 cipher compatibility
     if ($Ovpn -notmatch '(?im)^\s*data-ciphers\s+') {
         $CipherBlock = @"
 cipher AES-256-CBC

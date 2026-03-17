@@ -1,241 +1,139 @@
 # =========================================
-# OpenVPN Community Deployment Script
-# MME Automation / Remediation Playbook-Aligned
+# OpenVPN Community Deployment Script (ZIP Support Added)
 # =========================================
 
 $ErrorActionPreference = 'Stop'
 
-# -------------------------------------
-# Paths / Variables
-# -------------------------------------
-
-$StagePath   = "C:\MME\CS"
-$ClientPath  = Join-Path $StagePath "client"
-$LogPath     = "C:\MME\AutoLogs"
-$LogFile     = Join-Path $LogPath "OpenVPN_Deployment.log"
-
-$DownloadUrl = "https://swupdate.openvpn.org/community/releases/OpenVPN-2.6.10-I001-amd64.msi"
-$Installer   = Join-Path $StagePath "OpenVPN-2.6.10-I001-amd64.msi"
-
-$TapCtl      = "C:\Program Files\OpenVPN\bin\tapctl.exe"
-$Gui         = "C:\Program Files\OpenVPN\bin\openvpn-gui.exe"
-$ConfigDir   = "C:\Program Files\OpenVPN\config"
-$DeployedOvpn = Join-Path $ConfigDir "client.ovpn"
-
-$OvpnPath    = Join-Path $ClientPath "client.ovpn"
-$CaPath      = Join-Path $ClientPath "ca.crt"
-$CrtPath     = Join-Path $ClientPath "client.crt"
-$KeyPath     = Join-Path $ClientPath "client.pem"
-$OutPath     = Join-Path $ClientPath "client_inline.ovpn"
-
-# -------------------------------------
-# Functions
-# -------------------------------------
-
-function Write-Log {
-    param([string]$Message)
-
-    $Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $Line = "$Timestamp  $Message"
-
-    Write-Output $Line
-    $Line | Out-File -FilePath $LogFile -Append -Encoding utf8
-}
-
-function Ensure-Directory {
-    param([string]$Path)
-
-    if (!(Test-Path $Path)) {
-        New-Item -ItemType Directory -Path $Path -Force | Out-Null
-    }
+# Ensure staging directory exists
+$path = "C:\MME\CS"
+if (!(Test-Path $path)) {
+    New-Item -ItemType Directory -Path $path | Out-Null
 }
 
 # -------------------------------------
-# Execution
+# Extract client.zip if present
 # -------------------------------------
 
-try {
-    Ensure-Directory -Path $StagePath
-    Ensure-Directory -Path $ClientPath
-    Ensure-Directory -Path $LogPath
+$zip = "C:\MME\CS\client.zip"
+$clientPath = "C:\MME\CS\client"
 
-    Write-Log "---- OpenVPN Deployment Starting ----"
+if (Test-Path $zip) {
+    Write-Output "ZIP detected: $zip"
 
-    # -------------------------------------
-    # Download OpenVPN Community Installer
-    # -------------------------------------
-
-    Write-Log "Downloading OpenVPN Community installer"
-    Invoke-WebRequest -Uri $DownloadUrl -OutFile $Installer
-
-    if (!(Test-Path $Installer)) {
-        throw "Download failed: installer not found at $Installer"
+    if (Test-Path $clientPath) {
+        Write-Output "Clearing existing client folder"
+        Remove-Item "$clientPath\*" -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    Write-Log "Installer downloaded: $Installer"
+    Write-Output "Extracting ZIP"
+    Expand-Archive -Path $zip -DestinationPath "C:\MME\CS" -Force
 
-    # -------------------------------------
-    # Install OpenVPN Community
-    # -------------------------------------
+    Start-Sleep 2
 
-    Write-Log "Installing OpenVPN Community"
-    Start-Process "msiexec.exe" -ArgumentList "/i `"$Installer`" /qn /norestart" -Wait
-
-    Write-Log "OpenVPN installation completed"
-
-    # -------------------------------------
-    # Ensure TAP Adapter Exists
-    # -------------------------------------
-
-    if (!(Test-Path $TapCtl)) {
-        throw "tapctl.exe not found: $TapCtl"
+    # Handle nested folder issue
+    $nested = "C:\MME\CS\client\client"
+    if (Test-Path $nested) {
+        Write-Output "Nested folder detected, flattening"
+        Move-Item "$nested\*" $clientPath -Force
+        Remove-Item $nested -Recurse -Force
     }
 
-    $Tap = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
-        $_.InterfaceDescription -like "*TAP*" -and
-        $_.Status -ne "Not Present"
-    }
+    Write-Output "ZIP extraction complete"
+}
+else {
+    Write-Output "No ZIP found, assuming files already present"
+}
 
-    if (!$Tap) {
-        Write-Log "No working TAP adapter found. Creating one."
-        & $TapCtl create | Out-Null
-        Start-Sleep -Seconds 3
-        Write-Log "TAP adapter created"
-    }
-    else {
-        Write-Log "Existing TAP adapter detected"
-    }
+# -------------------------------------
+# Download OpenVPN Community Edition
+# -------------------------------------
 
-    # -------------------------------------
-    # Extract Client Package (TGZ)
-    # -------------------------------------
+$url = "https://swupdate.openvpn.org/community/releases/OpenVPN-2.6.10-I001-amd64.msi"
+$file = "C:\MME\CS\OpenVPN-2.6.10-I001-amd64.msi"
 
-    $TgzPath = Join-Path $StagePath "client.tgz"
+Invoke-WebRequest $url -OutFile $file
 
-    if (Test-Path $TgzPath) {
-        Write-Log "Client TGZ detected: $TgzPath"
+# Install silently
+if (!(Test-Path $file)) {
+    Write-Error "Installer not found: $file"
+    exit 1
+}
 
-        # Clean existing client directory
-        if (Test-Path $ClientPath) {
-            Write-Log "Clearing existing client directory"
-            Remove-Item "$ClientPath\*" -Recurse -Force -ErrorAction SilentlyContinue
-        }
+Start-Process $file -ArgumentList "/qn /norestart" -Wait
 
-        Write-Log "Extracting client TGZ"
-        Expand-Archive -Path $TgzPath -DestinationPath $StagePath -Force
+# -------------------------------------
+# Edit OVPN file
+# -------------------------------------
 
-        Start-Sleep -Seconds 2
+$folder = "C:\MME\CS\client"
 
-        # Handle nested structure
-        $NestedClient = Join-Path $StagePath "client\client"
+$ovpnPath = Join-Path $folder "client.ovpn"
+$caPath   = Join-Path $folder "ca.crt"
+$crtPath  = Join-Path $folder "client.crt"
+$keyPath  = Join-Path $folder "client.pem"
+$outPath  = Join-Path $folder "client_inline.ovpn"
 
-        if (Test-Path $NestedClient) {
-            Write-Log "Nested client folder detected. Flattening structure"
-            Move-Item "$NestedClient\*" $ClientPath -Force
-            Remove-Item $NestedClient -Recurse -Force
-        }
+# Validate required files exist
+if (!(Test-Path $ovpnPath)) { throw "Missing file: $ovpnPath" }
+if (!(Test-Path $caPath))   { throw "Missing file: $caPath" }
+if (!(Test-Path $crtPath))  { throw "Missing file: $crtPath" }
+if (!(Test-Path $keyPath))  { throw "Missing file: $keyPath" }
 
-        Write-Log "Client TGZ extraction complete"
-    }
-    else {
-        Write-Log "No client TGZ found. Assuming files already present"
-    }
+# Load file contents
+$ovpn = Get-Content $ovpnPath -Raw
+$ca   = Get-Content $caPath   -Raw
+$crt  = Get-Content $crtPath  -Raw
+$key  = Get-Content $keyPath  -Raw
 
-    # -------------------------------------
-    # Validate Transferred Client Files
-    # -------------------------------------
+# Remove external certificate/key directives
+$ovpn = $ovpn -replace '(?im)^\s*ca\s+.+\r?\n?', ''
+$ovpn = $ovpn -replace '(?im)^\s*cert\s+.+\r?\n?', ''
+$ovpn = $ovpn -replace '(?im)^\s*key\s+.+\r?\n?', ''
 
-    Write-Log "Validating transferred client OVPN files"
+# Ensure cipher compatibility
+if ($ovpn -notmatch '(?im)^\s*data-ciphers\s+') {
 
-    if (!(Test-Path $OvpnPath)) { throw "Missing file: $OvpnPath" }
-    if (!(Test-Path $CaPath))   { throw "Missing file: $CaPath" }
-    if (!(Test-Path $CrtPath))  { throw "Missing file: $CrtPath" }
-    if (!(Test-Path $KeyPath))  { throw "Missing file: $KeyPath" }
-
-    Write-Log "All required client files found"
-
-    # -------------------------------------
-    # Generate Inline OVPN Profile
-    # -------------------------------------
-
-    Write-Log "Generating inline VPN profile"
-
-    $Ovpn = Get-Content $OvpnPath -Raw
-    $Ca   = Get-Content $CaPath   -Raw
-    $Crt  = Get-Content $CrtPath  -Raw
-    $Key  = Get-Content $KeyPath  -Raw
-
-    $Ovpn = $Ovpn -replace '(?im)^\s*ca\s+.+\r?\n?', ''
-    $Ovpn = $Ovpn -replace '(?im)^\s*cert\s+.+\r?\n?', ''
-    $Ovpn = $Ovpn -replace '(?im)^\s*key\s+.+\r?\n?', ''
-
-    if ($Ovpn -notmatch '(?im)^\s*data-ciphers\s+') {
-        $CipherBlock = @"
+$cipherBlock = @"
 cipher AES-256-CBC
 data-ciphers AES-256-GCM:AES-256-CBC
 data-ciphers-fallback AES-256-CBC
 
 "@
-        $Ovpn = $CipherBlock + $Ovpn
-    }
 
-    $Ovpn = $Ovpn.TrimEnd()
+    $ovpn = $cipherBlock + $ovpn
+}
 
-    $InlineBlock = @"
+$ovpn = $ovpn.TrimEnd()
+
+$inlineBlock = @"
 
 <ca>
-$($Ca.Trim())
+$($ca.Trim())
 </ca>
 
 <cert>
-$($Crt.Trim())
+$($crt.Trim())
 </cert>
 
 <key>
-$($Key.Trim())
+$($key.Trim())
 </key>
 "@
 
-    $Final = $Ovpn + "`r`n" + $InlineBlock.TrimStart()
-    Set-Content -Path $OutPath -Value $Final -Encoding ascii
+$final = $ovpn + "`r`n" + $inlineBlock.TrimStart()
 
-    Write-Log "Inline VPN profile created: $OutPath"
+Set-Content -Path $outPath -Value $final -Encoding ascii
 
-    # -------------------------------------
-    # Deploy Profile to OpenVPN
-    # -------------------------------------
+Write-Output "Created: $outPath"
 
-    Ensure-Directory -Path $ConfigDir
-    Copy-Item $OutPath $DeployedOvpn -Force
+# -------------------------------------
+# Import into OpenVPN GUI
+# -------------------------------------
 
-    Write-Log "VPN profile deployed to: $DeployedOvpn"
+Copy-Item $outPath "C:\Program Files\OpenVPN\config\client.ovpn" -Force
 
-    # -------------------------------------
-    # Launch GUI
-    # -------------------------------------
+Start-Process "C:\Program Files\OpenVPN\bin\openvpn-gui.exe"
 
-    if (!(Test-Path $Gui)) {
-        throw "OpenVPN GUI missing: $Gui"
-    }
+Start-Sleep 3
 
-    Write-Log "Launching OpenVPN GUI"
-    Start-Process $Gui
-
-    Start-Sleep -Seconds 3
-
-    # -------------------------------------
-    # Trigger Connection
-    # -------------------------------------
-
-    Write-Log "Triggering VPN connection"
-    & $Gui --connect client.ovpn
-
-    Write-Log "---- OpenVPN Deployment Complete ----"
-    Write-Output "SUCCESS"
-    exit 0
-}
-catch {
-    Write-Log "ERROR: $($_.Exception.Message)"
-    Write-Output "ERROR"
-    exit 1
-}
+& "C:\Program Files\OpenVPN\bin\openvpn-gui.exe" --connect client.ovpn

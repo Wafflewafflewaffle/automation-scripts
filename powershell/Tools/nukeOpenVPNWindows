@@ -1,0 +1,151 @@
+# =========================================
+# OpenVPN FULL REMOVAL SCRIPT (Windows)
+# MME-Aligned
+# =========================================
+
+$ErrorActionPreference = 'SilentlyContinue'
+
+Write-Output "====================================="
+Write-Output "Starting OpenVPN FULL cleanup..."
+Write-Output "====================================="
+
+# -----------------------------
+# Kill processes
+# -----------------------------
+
+Write-Output "Stopping OpenVPN processes..."
+
+Get-Process | Where-Object {
+    $_.Name -match "openvpn|openvpn-gui|ovpn"
+} | Stop-Process -Force -ErrorAction SilentlyContinue
+
+# -----------------------------
+# Stop and remove services
+# -----------------------------
+
+$services = @(
+    "OpenVPNService",
+    "OpenVPNServiceInteractive",
+    "ovpn-dco"
+)
+
+foreach ($svc in $services) {
+    if (Get-Service -Name $svc -ErrorAction SilentlyContinue) {
+        Stop-Service $svc -Force -ErrorAction SilentlyContinue
+        sc.exe delete $svc | Out-Null
+        Write-Output "Removed service: $svc"
+    }
+}
+
+# -----------------------------
+# Uninstall via registry (AppWiz method)
+# -----------------------------
+
+Write-Output "Uninstalling OpenVPN products..."
+
+$RegPaths = @(
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+)
+
+$Apps = foreach ($Path in $RegPaths) {
+    Get-ItemProperty $Path -ErrorAction SilentlyContinue | Where-Object {
+        $_.DisplayName -match "OpenVPN"
+    }
+}
+
+foreach ($app in $Apps) {
+    $name = $app.DisplayName
+    $uninstall = $app.UninstallString
+
+    if ($uninstall) {
+        Write-Output "Uninstalling: $name"
+
+        if ($uninstall -match "msiexec") {
+            $uninstall = $uninstall -replace "/I", "/X"
+            $uninstall += " /qn /norestart"
+        }
+
+        Start-Process "cmd.exe" -ArgumentList "/c $uninstall" -Wait
+    }
+}
+
+# -----------------------------
+# Remove TAP / Wintun adapters
+# -----------------------------
+
+Write-Output "Removing network adapters..."
+
+Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+    $_.InterfaceDescription -match "TAP|Wintun|OpenVPN"
+} | ForEach-Object {
+    Disable-NetAdapter -Name $_.Name -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-NetAdapter -Name $_.Name -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Output "Removed adapter: $($_.Name)"
+}
+
+# -----------------------------
+# Driver cleanup (optional visibility)
+# -----------------------------
+
+Write-Output ""
+Write-Output "Checking driver store..."
+
+pnputil /enum-drivers | Select-String -Pattern "tap|wintun|openvpn" -Context 0,3
+
+Write-Output ""
+Write-Output "If drivers remain, remove with:"
+Write-Output "pnputil /delete-driver oemXX.inf /uninstall /force"
+
+# -----------------------------
+# Remove file system remnants
+# -----------------------------
+
+Write-Output "Removing file remnants..."
+
+$paths = @(
+    "C:\Program Files\OpenVPN",
+    "C:\Program Files (x86)\OpenVPN",
+    "C:\ProgramData\OpenVPN",
+    "$env:USERPROFILE\OpenVPN",
+    "$env:APPDATA\OpenVPN",
+    "$env:LOCALAPPDATA\OpenVPN"
+)
+
+foreach ($p in $paths) {
+    if (Test-Path $p) {
+        Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Output "Removed: $p"
+    }
+}
+
+# -----------------------------
+# Registry cleanup
+# -----------------------------
+
+Write-Output "Cleaning registry..."
+
+$regPaths = @(
+    "HKLM:\SOFTWARE\OpenVPN",
+    "HKLM:\SOFTWARE\WOW6432Node\OpenVPN",
+    "HKCU:\SOFTWARE\OpenVPN"
+)
+
+foreach ($r in $regPaths) {
+    if (Test-Path $r) {
+        Remove-Item $r -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Output "Removed registry key: $r"
+    }
+}
+
+# -----------------------------
+# Finish
+# -----------------------------
+
+Write-Output ""
+Write-Output "====================================="
+Write-Output "OpenVPN environment fully cleaned."
+Write-Output "Reboot strongly recommended."
+Write-Output "====================================="
+
+exit 0

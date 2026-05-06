@@ -1,0 +1,523 @@
+#Requires -Version 5.1
+
+# NAME
+#   REMEDIATION - ScreenConnect Presence
+#
+# VARIABLES
+#   $LogRoot             = C:\MME\AutoLogs
+#   $LogFile             = C:\MME\AutoLogs\Remove-ScreenConnect-Remediation.log
+#   $AgeThresholdHours   = Not used in remediation; evaluation gates this condition
+#   $MaxSummaryLines     = 50
+#   $MaxSummaryChars     = 4000
+#
+# OUTPUT TOKENS
+#   REMEDIATED = ScreenConnect install and/or ScreenConnect .exe/.msi file remediation performed
+#   NO_ACTION  = No ScreenConnect install or ScreenConnect .exe/.msi file found at remediation time
+#   ERROR      = Remediation script failure
+#
+# LOGGING PATH
+#   C:\MME\AutoLogs\Remove-ScreenConnect-Remediation.log
+
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version 2
+
+# -------------------------------------
+# Config
+# -------------------------------------
+$LogRoot = "C:\MME\AutoLogs"
+$LogFile = Join-Path $LogRoot "Remove-ScreenConnect-Remediation.log"
+
+$MaxSummaryLines = 50
+$MaxSummaryChars = 4000
+
+$RemediationSummaryMessage = "ScreenConnect Removed"
+
+# -------------------------------------
+# Logging
+# -------------------------------------
+
+# Writes timestamped log entries to C:\MME\AutoLogs.
+function Write-Log {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $Line = "$Timestamp | $Message"
+
+    if (-not (Test-Path -LiteralPath $LogRoot)) {
+        New-Item -Path $LogRoot -ItemType Directory -Force | Out-Null
+    }
+
+    Add-Content -Path $LogFile -Value $Line -Encoding UTF8
+}
+
+# Standard remediation finish helper.
+# Remediation scripts are Ninja-safe and always exit 0.
+function Finish {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("REMEDIATED", "NO_ACTION", "ERROR")]
+        [string]$Result,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    Write-Log "$Result | $Message"
+    Write-Output $Result
+    exit 0
+}
+
+# -------------------------------------
+# Ninja custom field helpers
+# -------------------------------------
+
+# Reads a Ninja custom field. Returns empty string if unavailable.
+function Get-NinjaFieldValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FieldName
+    )
+
+    try {
+        return Ninja-Property-Get $FieldName
+    }
+    catch {
+        Write-Log "WARN | Failed to read Ninja custom field '$FieldName' | $($_.Exception.Message)"
+        return ""
+    }
+}
+
+# Writes a Ninja custom field. Returns true/false so ledger update can be validated.
+function Set-NinjaFieldValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FieldName,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$FieldValue
+    )
+
+    try {
+        Ninja-Property-Set $FieldName $FieldValue | Out-Null
+        return $true
+    }
+    catch {
+        Write-Log "ERROR | Failed to write Ninja custom field '$FieldName' | $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# Appends a clean remediationSummary entry and updates lastRemediationDate.
+# This must only run after remediation actually occurs.
+function Update-RemediationLedger {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SummaryMessage
+    )
+
+    $DateOnly = Get-Date -Format "yyyy-MM-dd"
+    $IsoTimestamp = (Get-Date).ToUniversalTime().ToString("o")
+    $NewEntry = "$DateOnly | $SummaryMessage"
+
+    $ExistingSummary = Get-NinjaFieldValue -FieldName "remediationSummary"
+
+    $Lines = New-Object System.Collections.Generic.List[string]
+
+    if (-not [string]::IsNullOrWhiteSpace($ExistingSummary)) {
+        $ExistingSummary -split "(`r`n|`n|`r)" |
+            ForEach-Object {
+                $Line = ([string]$_).Trim()
+                if (-not [string]::IsNullOrWhiteSpace($Line)) {
+                    $Lines.Add($Line) | Out-Null
+                }
+            }
+    }
+
+    if (-not $Lines.Contains($NewEntry)) {
+        $Lines.Add($NewEntry) | Out-Null
+    }
+
+    while ($Lines.Count -gt $MaxSummaryLines) {
+        $Lines.RemoveAt(0)
+    }
+
+    $UpdatedSummary = ($Lines -join [Environment]::NewLine)
+
+    while ($UpdatedSummary.Length -gt $MaxSummaryChars -and $Lines.Count -gt 1) {
+        $Lines.RemoveAt(0)
+        $UpdatedSummary = ($Lines -join [Environment]::NewLine)
+    }
+
+    $SummaryUpdated = Set-NinjaFieldValue -FieldName "remediationSummary" -FieldValue $UpdatedSummary
+    $DateUpdated = Set-NinjaFieldValue -FieldName "lastRemediationDate" -FieldValue $IsoTimestamp
+
+    if ($SummaryUpdated -and $DateUpdated) {
+        Write-Log "Updated remediation ledger | lastRemediationDate=$IsoTimestamp | remediationSummary entry='$NewEntry'"
+        return $true
+    }
+
+    return $false
+}
+
+# -------------------------------------
+# Process helper
+# -------------------------------------
+
+# Runs a process with timeout and logs stdout/stderr.
+function Invoke-ProcessWithTimeout {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$Arguments,
+
+        [Parameter(Mandatory = $false)]
+        [int]$TimeoutSeconds = 600
+    )
+
+    Write-Log "Running process | FilePath=$FilePath | Arguments=$Arguments"
+
+    $StartInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $StartInfo.FileName = $FilePath
+    $StartInfo.Arguments = $Arguments
+    $StartInfo.UseShellExecute = $false
+    $StartInfo.RedirectStandardOutput = $true
+    $StartInfo.RedirectStandardError = $true
+    $StartInfo.CreateNoWindow = $true
+
+    $Process = New-Object System.Diagnostics.Process
+    $Process.StartInfo = $StartInfo
+
+    $Started = $Process.Start()
+
+    if (-not $Started) {
+        throw "Failed to start process: $FilePath"
+    }
+
+    $Exited = $Process.WaitForExit($TimeoutSeconds * 1000)
+
+    if (-not $Exited) {
+        try {
+            $Process.Kill()
+        }
+        catch {
+            Write-Log "WARN | Failed to kill timed-out process | $($_.Exception.Message)"
+        }
+
+        throw "Process timed out after $TimeoutSeconds seconds: $FilePath $Arguments"
+    }
+
+    $StdOut = $Process.StandardOutput.ReadToEnd()
+    $StdErr = $Process.StandardError.ReadToEnd()
+    $ExitCode = $Process.ExitCode
+
+    if (-not [string]::IsNullOrWhiteSpace($StdOut)) {
+        Write-Log "PROCESS_STDOUT | $StdOut"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($StdErr)) {
+        Write-Log "PROCESS_STDERR | $StdErr"
+    }
+
+    Write-Log "Process completed | ExitCode=$ExitCode"
+
+    return $ExitCode
+}
+
+# -------------------------------------
+# Installed app discovery/removal
+# -------------------------------------
+
+# Finds uninstall registry entries with DisplayName containing ScreenConnect.
+# Does not target ConnectWise entries unless ScreenConnect is in the name.
+function Get-ScreenConnectInstallEntries {
+    Write-Log "Searching uninstall registry entries for ScreenConnect installs."
+
+    $Results = New-Object System.Collections.Generic.List[object]
+    $UninstallRoots = New-Object System.Collections.Generic.List[object]
+
+    $UninstallRoots.Add([PSCustomObject]@{
+        Hive   = "HKLM"
+        PsPath = "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    }) | Out-Null
+
+    $UninstallRoots.Add([PSCustomObject]@{
+        Hive   = "HKLM"
+        PsPath = "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    }) | Out-Null
+
+    $LoadedUserHives = Get-ChildItem -LiteralPath "Registry::HKEY_USERS" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.PSChildName -match '^S-\d-\d+-.+' -and
+            $_.PSChildName -notmatch '_Classes$'
+        }
+
+    foreach ($Hive in $LoadedUserHives) {
+        $Sid = $Hive.PSChildName
+
+        $UninstallRoots.Add([PSCustomObject]@{
+            Hive   = "HKU"
+            PsPath = "Registry::HKEY_USERS\$Sid\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+        }) | Out-Null
+
+        $UninstallRoots.Add([PSCustomObject]@{
+            Hive   = "HKU"
+            PsPath = "Registry::HKEY_USERS\$Sid\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+        }) | Out-Null
+    }
+
+    foreach ($Root in $UninstallRoots) {
+        if (-not (Test-Path -LiteralPath $Root.PsPath)) {
+            continue
+        }
+
+        $SubKeys = Get-ChildItem -LiteralPath $Root.PsPath -ErrorAction SilentlyContinue
+
+        foreach ($SubKey in $SubKeys) {
+            try {
+                $Props = Get-ItemProperty -LiteralPath $SubKey.PSPath -ErrorAction Stop
+
+                $DisplayNameProperty = $Props.PSObject.Properties["DisplayName"]
+
+                if ($null -eq $DisplayNameProperty) {
+                    continue
+                }
+
+                $DisplayName = [string]$DisplayNameProperty.Value
+
+                if ([string]::IsNullOrWhiteSpace($DisplayName)) {
+                    continue
+                }
+
+                if ($DisplayName -notlike "*ScreenConnect*") {
+                    continue
+                }
+
+                $QuietUninstallString = ""
+                $UninstallString = ""
+
+                $QuietProperty = $Props.PSObject.Properties["QuietUninstallString"]
+                if ($null -ne $QuietProperty) {
+                    $QuietUninstallString = [string]$QuietProperty.Value
+                }
+
+                $UninstallProperty = $Props.PSObject.Properties["UninstallString"]
+                if ($null -ne $UninstallProperty) {
+                    $UninstallString = [string]$UninstallProperty.Value
+                }
+
+                $Results.Add([PSCustomObject]@{
+                    DisplayName          = $DisplayName
+                    RegistryPath         = $SubKey.PSPath
+                    RegistryKeyName      = $SubKey.PSChildName
+                    QuietUninstallString = $QuietUninstallString
+                    UninstallString      = $UninstallString
+                }) | Out-Null
+            }
+            catch {
+                Write-Log "WARN | Failed to inspect uninstall entry: $($SubKey.PSPath) | $($_.Exception.Message)"
+            }
+        }
+    }
+
+    return $Results
+}
+
+# Attempts to uninstall a ScreenConnect install entry.
+# Prefers QuietUninstallString, then MSI product-code uninstall.
+function Remove-ScreenConnectInstall {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$InstallEntry
+    )
+
+    Write-Log "Attempting uninstall | DisplayName=$($InstallEntry.DisplayName) | RegistryPath=$($InstallEntry.RegistryPath)"
+
+    if (-not [string]::IsNullOrWhiteSpace($InstallEntry.QuietUninstallString)) {
+        $ExitCode = Invoke-ProcessWithTimeout `
+            -FilePath $env:ComSpec `
+            -Arguments "/c $($InstallEntry.QuietUninstallString)" `
+            -TimeoutSeconds 600
+
+        if ($ExitCode -eq 0 -or $ExitCode -eq 3010 -or $ExitCode -eq 1605) {
+            Write-Log "Uninstall succeeded via QuietUninstallString | DisplayName=$($InstallEntry.DisplayName) | ExitCode=$ExitCode"
+            return $true
+        }
+
+        Write-Log "WARN | QuietUninstallString returned non-success exit code | DisplayName=$($InstallEntry.DisplayName) | ExitCode=$ExitCode"
+    }
+
+    $ProductCode = $null
+
+    if ($InstallEntry.RegistryKeyName -match '^\{[0-9A-Fa-f-]{36}\}$') {
+        $ProductCode = $InstallEntry.RegistryKeyName
+    }
+    elseif ($InstallEntry.UninstallString -match '\{[0-9A-Fa-f-]{36}\}') {
+        $ProductCode = $Matches[0]
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ProductCode)) {
+        $ExitCode = Invoke-ProcessWithTimeout `
+            -FilePath "msiexec.exe" `
+            -Arguments "/x $ProductCode /qn /norestart" `
+            -TimeoutSeconds 600
+
+        if ($ExitCode -eq 0 -or $ExitCode -eq 3010 -or $ExitCode -eq 1605) {
+            Write-Log "Uninstall succeeded via MSI product code | DisplayName=$($InstallEntry.DisplayName) | ProductCode=$ProductCode | ExitCode=$ExitCode"
+            return $true
+        }
+
+        Write-Log "WARN | MSI uninstall returned non-success exit code | DisplayName=$($InstallEntry.DisplayName) | ProductCode=$ProductCode | ExitCode=$ExitCode"
+        return $false
+    }
+
+    Write-Log "WARN | No quiet uninstall or MSI product code available for ScreenConnect install | DisplayName=$($InstallEntry.DisplayName)"
+    return $false
+}
+
+# -------------------------------------
+# File discovery/removal
+# -------------------------------------
+
+# Finds ScreenConnect-named .exe and .msi files across fixed local drives.
+function Get-ScreenConnectInstallerFiles {
+    Write-Log "Searching fixed local drives for ScreenConnect .exe/.msi files."
+
+    $Results = New-Object System.Collections.Generic.List[object]
+
+    $FixedDrives = Get-CimInstance -ClassName Win32_LogicalDisk |
+        Where-Object { $_.DriveType -eq 3 -and $_.DeviceID }
+
+    if (-not $FixedDrives) {
+        throw "No fixed local drives found to scan."
+    }
+
+    foreach ($Drive in $FixedDrives) {
+        $RootPath = "$($Drive.DeviceID)\"
+
+        Write-Log "Scanning fixed drive for ScreenConnect .exe/.msi files: $RootPath"
+
+        $FoundFiles = Get-ChildItem `
+            -LiteralPath $RootPath `
+            -Filter "*ScreenConnect*" `
+            -File `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -match '(?i)ScreenConnect' -and
+                $_.Name -match '(?i)\.(exe|msi)$'
+            }
+
+        foreach ($File in $FoundFiles) {
+            $Results.Add($File) | Out-Null
+        }
+    }
+
+    return $Results
+}
+
+# Deletes a ScreenConnect-named .exe or .msi file.
+function Remove-ScreenConnectInstallerFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo]$File
+    )
+
+    try {
+        Write-Log "Deleting file | Path=$($File.FullName) | LastWriteUtc=$($File.LastWriteTimeUtc)"
+        Remove-Item -LiteralPath $File.FullName -Force -ErrorAction Stop
+        Write-Log "Deleted file | Path=$($File.FullName)"
+        return $true
+    }
+    catch {
+        Write-Log "ERROR | Failed to delete file | Path=$($File.FullName) | $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# -------------------------------------
+# Main
+# -------------------------------------
+try {
+    Write-Log "Starting ScreenConnect remediation."
+    Write-Log "Reminder: remediation is downstream-only. Age logic is handled by the evaluation script."
+
+    $SuccessfulActions = New-Object System.Collections.Generic.List[string]
+    $FailedActions = New-Object System.Collections.Generic.List[string]
+
+    $InstallEntries = @(Get-ScreenConnectInstallEntries)
+
+    foreach ($InstallEntry in $InstallEntries) {
+        $Removed = Remove-ScreenConnectInstall -InstallEntry $InstallEntry
+
+        if ($Removed) {
+            $SuccessfulActions.Add("Install removed: $($InstallEntry.DisplayName)") | Out-Null
+        }
+        else {
+            $FailedActions.Add("Install removal failed: $($InstallEntry.DisplayName)") | Out-Null
+        }
+    }
+
+    $InstallerFiles = @(Get-ScreenConnectInstallerFiles)
+
+    foreach ($File in $InstallerFiles) {
+        $Removed = Remove-ScreenConnectInstallerFile -File $File
+
+        if ($Removed) {
+            $SuccessfulActions.Add("File deleted: $($File.FullName)") | Out-Null
+        }
+        else {
+            $FailedActions.Add("File deletion failed: $($File.FullName)") | Out-Null
+        }
+    }
+
+    Write-Log "Remediation summary | InstallsFound=$($InstallEntries.Count) | FilesFound=$($InstallerFiles.Count) | SuccessfulActions=$($SuccessfulActions.Count) | FailedActions=$($FailedActions.Count)"
+
+    foreach ($Action in $SuccessfulActions) {
+        Write-Log "SUCCESS_ACTION | $Action"
+    }
+
+    foreach ($Action in $FailedActions) {
+        Write-Log "FAILED_ACTION | $Action"
+    }
+
+    if ($SuccessfulActions.Count -gt 0) {
+        $LedgerUpdated = Update-RemediationLedger -SummaryMessage $RemediationSummaryMessage
+
+        if (-not $LedgerUpdated) {
+            Finish -Result "ERROR" -Message "ScreenConnect remediation performed, but remediation ledger update failed."
+        }
+
+        if ($FailedActions.Count -gt 0) {
+            Finish -Result "ERROR" -Message "ScreenConnect remediation partially completed. Review log for failed actions."
+        }
+
+        Finish -Result "REMEDIATED" -Message "ScreenConnect remediation completed."
+    }
+
+    if ($FailedActions.Count -gt 0) {
+        Finish -Result "ERROR" -Message "ScreenConnect remediation failed. Review log for details."
+    }
+
+    Finish -Result "NO_ACTION" -Message "No ScreenConnect install or ScreenConnect .exe/.msi file found at remediation time."
+}
+catch {
+    $ErrorMessage = $_.Exception.Message
+
+    try {
+        Write-Log "ERROR | ScreenConnect remediation failed: $ErrorMessage"
+    }
+    catch {
+        # If logging fails, still emit ERROR.
+    }
+
+    Write-Output "ERROR"
+    exit 0
+}

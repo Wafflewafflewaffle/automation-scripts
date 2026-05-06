@@ -1,0 +1,513 @@
+#Requires -Version 5.1
+
+# NAME
+#   EVALUATION - ScreenConnect Presence
+#
+# VARIABLES
+#   $LogRoot           = C:\MME\AutoLogs
+#   $LogFile           = C:\MME\AutoLogs\Detect-ScreenConnect-Eval.log
+#   $AgeThresholdHours = 24
+#
+# OUTPUT TOKENS
+#   TRIGGER   = ScreenConnect install or ScreenConnect .exe/.msi file exists and is older than 24 hours
+#   NO_ACTION = No qualifying ScreenConnect install/file found, or found item is newer than 24 hours
+#   ERROR     = Evaluation script failure
+#
+# LOGGING PATH
+#   C:\MME\AutoLogs\Detect-ScreenConnect-Eval.log
+
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version 2
+
+# -------------------------------------
+# Config
+# -------------------------------------
+$LogRoot = "C:\MME\AutoLogs"
+$LogFile = Join-Path $LogRoot "Detect-ScreenConnect-Eval.log"
+
+$AgeThresholdHours = 24
+$NowUtc = (Get-Date).ToUniversalTime()
+$CutoffUtc = $NowUtc.AddHours(-$AgeThresholdHours)
+
+# -------------------------------------
+# Logging
+# -------------------------------------
+function Write-Log {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $Line = "$Timestamp | $Message"
+
+    if (-not (Test-Path -LiteralPath $LogRoot)) {
+        New-Item -Path $LogRoot -ItemType Directory -Force | Out-Null
+    }
+
+    Add-Content -Path $LogFile -Value $Line -Encoding UTF8
+}
+
+# Standard eval finish helper.
+# Eval scripts are Ninja-safe and always exit 0.
+function Finish {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("TRIGGER", "NO_ACTION", "ERROR")]
+        [string]$Result,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    Write-Log "$Result | $Message"
+    Write-Output $Result
+    exit 0
+}
+
+# -------------------------------------
+# Registry LastWrite helper
+# -------------------------------------
+
+# Adds a small C# helper used only to read registry key LastWriteTime.
+# This lets install detection use a timestamp with time precision when available.
+function Initialize-RegistryLastWriteHelper {
+    if (([System.Management.Automation.PSTypeName]'MME.RegistryLastWrite').Type) {
+        return
+    }
+
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace MME {
+    public static class RegistryLastWrite {
+        private static readonly IntPtr HKEY_LOCAL_MACHINE = new IntPtr(unchecked((int)0x80000002));
+        private static readonly IntPtr HKEY_USERS = new IntPtr(unchecked((int)0x80000003));
+        private const int KEY_READ = 0x20019;
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern int RegOpenKeyEx(
+            IntPtr hKey,
+            string subKey,
+            int ulOptions,
+            int samDesired,
+            out IntPtr phkResult
+        );
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern int RegCloseKey(IntPtr hKey);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern int RegQueryInfoKey(
+            IntPtr hKey,
+            StringBuilder lpClass,
+            ref uint lpcchClass,
+            IntPtr lpReserved,
+            out uint lpcSubKeys,
+            out uint lpcbMaxSubKeyLen,
+            out uint lpcbMaxClassLen,
+            out uint lpcValues,
+            out uint lpcbMaxValueNameLen,
+            out uint lpcbMaxValueLen,
+            out uint lpcbSecurityDescriptor,
+            out long lpftLastWriteTime
+        );
+
+        public static DateTime GetLastWriteUtc(string hive, string subKey) {
+            IntPtr root;
+
+            if (hive == "HKLM") {
+                root = HKEY_LOCAL_MACHINE;
+            }
+            else if (hive == "HKU") {
+                root = HKEY_USERS;
+            }
+            else {
+                throw new ArgumentException("Unsupported hive: " + hive);
+            }
+
+            IntPtr keyHandle;
+            int openResult = RegOpenKeyEx(root, subKey, 0, KEY_READ, out keyHandle);
+
+            if (openResult != 0) {
+                throw new InvalidOperationException("RegOpenKeyEx failed with code " + openResult);
+            }
+
+            try {
+                uint classLength = 0;
+                uint subKeyCount;
+                uint maxSubKeyLength;
+                uint maxClassLength;
+                uint valueCount;
+                uint maxValueNameLength;
+                uint maxValueLength;
+                uint securityDescriptorLength;
+                long lastWriteFileTime;
+
+                int queryResult = RegQueryInfoKey(
+                    keyHandle,
+                    null,
+                    ref classLength,
+                    IntPtr.Zero,
+                    out subKeyCount,
+                    out maxSubKeyLength,
+                    out maxClassLength,
+                    out valueCount,
+                    out maxValueNameLength,
+                    out maxValueLength,
+                    out securityDescriptorLength,
+                    out lastWriteFileTime
+                );
+
+                if (queryResult != 0) {
+                    throw new InvalidOperationException("RegQueryInfoKey failed with code " + queryResult);
+                }
+
+                return DateTime.FromFileTimeUtc(lastWriteFileTime);
+            }
+            finally {
+                RegCloseKey(keyHandle);
+            }
+        }
+    }
+}
+"@
+}
+
+# Reads the registry key LastWriteTime in UTC.
+# If it cannot be read, returns null so the caller can fall back cleanly.
+function Get-RegistryKeyLastWriteUtc {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("HKLM", "HKU")]
+        [string]$Hive,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SubKey
+    )
+
+    try {
+        return [MME.RegistryLastWrite]::GetLastWriteUtc($Hive, $SubKey)
+    }
+    catch {
+        Write-Log "WARN | Could not read registry last-write time for $Hive\$SubKey | $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# Parses uninstall InstallDate when registry LastWriteTime is unavailable.
+# InstallDate is date-only, so this uses the latest possible local time for that date
+# to avoid false-triggering when exact install time is unknown.
+function Get-ConservativeInstallDateUtc {
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [object]$InstallDate
+    )
+
+    if ($null -eq $InstallDate) {
+        return $null
+    }
+
+    $InstallDateString = [string]$InstallDate
+
+    if ([string]::IsNullOrWhiteSpace($InstallDateString)) {
+        return $null
+    }
+
+    if ($InstallDateString -notmatch '^\d{8}$') {
+        Write-Log "WARN | InstallDate value is not yyyyMMdd format: $InstallDateString"
+        return $null
+    }
+
+    try {
+        $ParsedDate = [datetime]::ParseExact(
+            $InstallDateString,
+            "yyyyMMdd",
+            [System.Globalization.CultureInfo]::InvariantCulture
+        )
+
+        $ConservativeLocalTime = $ParsedDate.Date.AddDays(1).AddTicks(-1)
+        $LocalKindTime = [datetime]::SpecifyKind($ConservativeLocalTime, [DateTimeKind]::Local)
+
+        return $LocalKindTime.ToUniversalTime()
+    }
+    catch {
+        Write-Log "WARN | Failed to parse InstallDate value: $InstallDateString | $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# Creates a normalized detection record for install and file findings.
+function New-DetectionRecord {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Install", "File")]
+        [string]$DetectionType,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [object]$TimestampUtc,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TimestampSource
+    )
+
+    $TimestampValueUtc = $null
+    $AgeHours = $null
+
+    if ($null -ne $TimestampUtc) {
+        $TimestampValueUtc = [datetime]$TimestampUtc
+
+        if ($TimestampValueUtc.Kind -ne [DateTimeKind]::Utc) {
+            $TimestampValueUtc = $TimestampValueUtc.ToUniversalTime()
+        }
+
+        $AgeHours = [math]::Round(($NowUtc - $TimestampValueUtc).TotalHours, 2)
+    }
+
+    [PSCustomObject]@{
+        DetectionType   = $DetectionType
+        Name            = $Name
+        Path            = $Path
+        TimestampUtc    = $TimestampValueUtc
+        TimestampSource = $TimestampSource
+        AgeHours        = $AgeHours
+    }
+}
+
+# -------------------------------------
+# Installed app detection
+# -------------------------------------
+
+# Checks uninstall registry entries for DisplayName containing ScreenConnect.
+# Does not trigger on ConnectWise by itself.
+function Get-ScreenConnectInstallDetections {
+    Write-Log "Starting ScreenConnect installed application detection."
+
+    $Results = New-Object System.Collections.Generic.List[object]
+    $UninstallRoots = New-Object System.Collections.Generic.List[object]
+
+    $UninstallRoots.Add([PSCustomObject]@{
+        Hive          = "HKLM"
+        PsPath        = "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+        NativeSubPath = "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    }) | Out-Null
+
+    $UninstallRoots.Add([PSCustomObject]@{
+        Hive          = "HKLM"
+        PsPath        = "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+        NativeSubPath = "SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    }) | Out-Null
+
+    $LoadedUserHives = Get-ChildItem -LiteralPath "Registry::HKEY_USERS" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.PSChildName -match '^S-\d-\d+-.+' -and
+            $_.PSChildName -notmatch '_Classes$'
+        }
+
+    foreach ($Hive in $LoadedUserHives) {
+        $Sid = $Hive.PSChildName
+
+        $UninstallRoots.Add([PSCustomObject]@{
+            Hive          = "HKU"
+            PsPath        = "Registry::HKEY_USERS\$Sid\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+            NativeSubPath = "$Sid\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+        }) | Out-Null
+
+        $UninstallRoots.Add([PSCustomObject]@{
+            Hive          = "HKU"
+            PsPath        = "Registry::HKEY_USERS\$Sid\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+            NativeSubPath = "$Sid\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+        }) | Out-Null
+    }
+
+    foreach ($Root in $UninstallRoots) {
+        if (-not (Test-Path -LiteralPath $Root.PsPath)) {
+            continue
+        }
+
+        Write-Log "Checking uninstall registry root: $($Root.PsPath)"
+
+        $SubKeys = Get-ChildItem -LiteralPath $Root.PsPath -ErrorAction SilentlyContinue
+
+        foreach ($SubKey in $SubKeys) {
+            try {
+                $Props = Get-ItemProperty -LiteralPath $SubKey.PSPath -ErrorAction Stop
+
+                $DisplayNameProperty = $Props.PSObject.Properties["DisplayName"]
+
+                if ($null -eq $DisplayNameProperty) {
+                    continue
+                }
+
+                $DisplayName = [string]$DisplayNameProperty.Value
+
+                if ([string]::IsNullOrWhiteSpace($DisplayName)) {
+                    continue
+                }
+
+                if ($DisplayName -notlike "*ScreenConnect*") {
+                    continue
+                }
+
+                $InstallDate = $null
+                $InstallDateProperty = $Props.PSObject.Properties["InstallDate"]
+
+                if ($null -ne $InstallDateProperty) {
+                    $InstallDate = $InstallDateProperty.Value
+                }
+
+                $NativeSubKeyPath = "$($Root.NativeSubPath)\$($SubKey.PSChildName)"
+
+                $TimestampUtc = Get-RegistryKeyLastWriteUtc -Hive $Root.Hive -SubKey $NativeSubKeyPath
+                $TimestampSource = "RegistryKeyLastWriteUtc"
+
+                if ($null -eq $TimestampUtc) {
+                    $TimestampUtc = Get-ConservativeInstallDateUtc -InstallDate $InstallDate
+                    $TimestampSource = "InstallDateDateOnlyConservativeUtc"
+                }
+
+                if ($null -eq $TimestampUtc) {
+                    $TimestampSource = "Unknown"
+                }
+
+                $Record = New-DetectionRecord `
+                    -DetectionType "Install" `
+                    -Name $DisplayName `
+                    -Path "$($Root.Hive)\$NativeSubKeyPath" `
+                    -TimestampUtc $TimestampUtc `
+                    -TimestampSource $TimestampSource
+
+                $Results.Add($Record) | Out-Null
+            }
+            catch {
+                Write-Log "WARN | Failed to inspect uninstall entry: $($SubKey.PSPath) | $($_.Exception.Message)"
+            }
+        }
+    }
+
+    return $Results
+}
+
+# -------------------------------------
+# File detection
+# -------------------------------------
+
+# Recursively scans fixed local drives for ScreenConnect-named .exe or .msi files only.
+# This checks file metadata only and does not open, read, hash, copy, execute, move, or delete files.
+function Get-ScreenConnectFileDetections {
+    Write-Log "Starting ScreenConnect file detection."
+
+    $Results = New-Object System.Collections.Generic.List[object]
+
+    $FixedDrives = Get-CimInstance -ClassName Win32_LogicalDisk |
+        Where-Object { $_.DriveType -eq 3 -and $_.DeviceID }
+
+    if (-not $FixedDrives) {
+        throw "No fixed local drives found to scan."
+    }
+
+    foreach ($Drive in $FixedDrives) {
+        $RootPath = "$($Drive.DeviceID)\"
+
+        Write-Log "Scanning fixed drive for ScreenConnect .exe/.msi files: $RootPath"
+
+        $FoundFiles = Get-ChildItem `
+            -LiteralPath $RootPath `
+            -Filter "*ScreenConnect*" `
+            -File `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -match '(?i)ScreenConnect' -and
+                $_.Name -match '(?i)\.(exe|msi)$'
+            }
+
+        foreach ($File in $FoundFiles) {
+            $Record = New-DetectionRecord `
+                -DetectionType "File" `
+                -Name $File.Name `
+                -Path $File.FullName `
+                -TimestampUtc $File.LastWriteTimeUtc `
+                -TimestampSource "FileLastWriteTimeUtc"
+
+            $Results.Add($Record) | Out-Null
+        }
+    }
+
+    return $Results
+}
+
+# -------------------------------------
+# Main
+# -------------------------------------
+try {
+    Write-Log "Starting ScreenConnect eval."
+    Write-Log "Current UTC time: $NowUtc"
+    Write-Log "Age threshold: older than $AgeThresholdHours hours."
+    Write-Log "UTC cutoff: $CutoffUtc"
+
+    Initialize-RegistryLastWriteHelper
+
+    $InstallDetections = @(Get-ScreenConnectInstallDetections)
+    $FileDetections = @(Get-ScreenConnectFileDetections)
+
+    $AllDetections = @()
+    $AllDetections += $InstallDetections
+    $AllDetections += $FileDetections
+
+    $QualifyingDetections = @(
+        $AllDetections |
+            Where-Object {
+                $null -ne $_.TimestampUtc -and
+                $_.TimestampUtc -lt $CutoffUtc
+            }
+    )
+
+    $NonQualifyingDetections = @(
+        $AllDetections |
+            Where-Object {
+                $null -eq $_.TimestampUtc -or
+                $_.TimestampUtc -ge $CutoffUtc
+            }
+    )
+
+    foreach ($Detection in $QualifyingDetections) {
+        Write-Log "QUALIFYING_FOUND | Type=$($Detection.DetectionType) | Name=$($Detection.Name) | Path=$($Detection.Path) | TimestampUtc=$($Detection.TimestampUtc) | Source=$($Detection.TimestampSource) | AgeHours=$($Detection.AgeHours)"
+    }
+
+    foreach ($Detection in $NonQualifyingDetections) {
+        Write-Log "NON_QUALIFYING_FOUND | Type=$($Detection.DetectionType) | Name=$($Detection.Name) | Path=$($Detection.Path) | TimestampUtc=$($Detection.TimestampUtc) | Source=$($Detection.TimestampSource) | AgeHours=$($Detection.AgeHours)"
+    }
+
+    Write-Log "Detection summary | InstallsFound=$($InstallDetections.Count) | FilesFound=$($FileDetections.Count) | Qualifying=$($QualifyingDetections.Count) | NonQualifying=$($NonQualifyingDetections.Count)"
+
+    if ($QualifyingDetections.Count -gt 0) {
+        Finish -Result "TRIGGER" -Message "ScreenConnect install or ScreenConnect .exe/.msi file older than $AgeThresholdHours hours detected."
+    }
+
+    Finish -Result "NO_ACTION" -Message "No ScreenConnect install or ScreenConnect .exe/.msi file older than $AgeThresholdHours hours detected."
+}
+catch {
+    $ErrorMessage = $_.Exception.Message
+
+    try {
+        Write-Log "ERROR | ScreenConnect eval failed: $ErrorMessage"
+    }
+    catch {
+        # If logging fails, still emit ERROR.
+    }
+
+    Write-Output "ERROR"
+    exit 0
+}
